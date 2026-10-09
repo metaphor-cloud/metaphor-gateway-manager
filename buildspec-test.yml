@@ -1,0 +1,13 @@
+version: 0.2
+
+# Run by cfn/pipeline.yml before it publishes.
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install -q -r requirements-dev.txt cfn-lint
+  build:
+    commands:
+      - python -m pytest -q tests
+      - cfn-lint template.yaml cfn/pipeline.yml

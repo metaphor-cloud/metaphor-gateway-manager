@@ -1,0 +1,12 @@
+version: 0.2
+
+# Run by cfn/pipeline.yml after the tests pass.
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install -q aws-sam-cli cfn-lint
+  build:
+    commands:
+      - ./scripts/publish.sh

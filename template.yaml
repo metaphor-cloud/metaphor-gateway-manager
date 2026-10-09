@@ -1,0 +1,541 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Metaphor Gateway manager: the Lambda functions a Metaphor Gateway deployment
+  needs (EIP/ENI lifecycle, NAT-only egress cutover, AMI auto-update, gossip
+  secret and orphan-cleanup custom resources), for nesting in your own
+  CloudFormation alongside the gateway's Auto Scaling groups.
+
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: metaphor-gateway-manager
+    Description: >-
+      Lifecycle and maintenance Lambdas for Metaphor Gateway: public ENI and
+      Elastic IP management (gwlb), persistent egress interface cutover
+      (NAT-only), AMI auto-update, gossip HMAC secret and orphan cleanup.
+    Author: Metaphor
+    LicenseUrl: LICENSE
+    ReadmeUrl: README.md
+    Labels: ['metaphor', 'nat', 'gwlb', 'eip', 'autoscaling', 'lifecycle-hook']
+    HomePageUrl: https://github.com/metaphor-cloud/metaphor-gateway-manager
+    SemanticVersion: 0.1.1
+    SourceCodeUrl: https://github.com/metaphor-cloud/metaphor-gateway-manager
+
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Gateway
+        Parameters:
+          - Mode
+          - GatewayStackName
+      - Label:
+          default: gwlb mode
+        Parameters:
+          - AsgName
+          - PublicSubnets
+          - PublicSecurityGroup
+          - EipAllocationIds
+          - EipsPerAz
+          - TargetGroupArn
+      - Label:
+          default: NAT-only mode
+        Parameters:
+          - NatAsgNames
+          - EgressEniIds
+      - Label:
+          default: Auto-update
+        Parameters:
+          - AutoUpdateEnabled
+          - UpdateCheckSchedule
+          - UpdateNotificationEmail
+
+Parameters:
+  Mode:
+    Type: String
+    AllowedValues:
+      - gwlb
+      - nat-only
+    Description: >-
+      gwlb deploys the EIP/ENI manager for a GWLB fleet and the orphan-cleanup
+      custom resource. nat-only deploys the egress cutover for one or more
+      NAT-only Auto Scaling groups of one. Both deploy the gossip secret custom
+      resource and, when enabled, the AMI updater.
+
+  GatewayStackName:
+    Type: String
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9-]*$'
+    Description: >-
+      Name of the stack that owns the gateway (pass !Ref AWS::StackName). The
+      functions tag what they create with metaphor:stack-name=<this>, scope
+      their IAM to resources carrying that tag, prefix their own names with it,
+      and the gossip secret must live under /flow/<this>/.
+
+  # --- gwlb ------------------------------------------------------------------
+  AsgName:
+    Type: String
+    Default: ''
+    Description: gwlb - name of the gateway Auto Scaling group.
+
+  PublicSubnets:
+    Type: String
+    Default: ''
+    Description: >-
+      gwlb - comma-separated public subnet IDs, one per AZ. Order partitions
+      EipAllocationIds into per-AZ pools.
+
+  PublicSecurityGroup:
+    Type: String
+    Default: ''
+    Description: gwlb - security group for the managed public ENIs.
+
+  EipAllocationIds:
+    Type: String
+    Default: ''
+    Description: >-
+      gwlb - comma-separated Elastic IP allocation IDs, EipsPerAz per public
+      subnet in PublicSubnets order. Empty with EipsPerAz=0.
+
+  EipsPerAz:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: >-
+      gwlb - Elastic IPs per AZ. 0 is single-ENI (no managed ENI or EIP); 1 is a
+      stable per-AZ IP migrated to the successor on refresh; 2 or more is a
+      blue/green pool. Set the gateway's FLOW_EIPS_PER_AZ to the same value.
+
+  TargetGroupArn:
+    Type: String
+    Default: ''
+    Description: gwlb - GWLB target group; a terminating instance is deregistered first.
+
+  # --- NAT-only --------------------------------------------------------------
+  NatAsgNames:
+    Type: String
+    Default: ''
+    Description: >-
+      nat-only - comma-separated names of the NAT-only Auto Scaling groups (each
+      a group of one), e.g. mystack-nat-a,mystack-nat-b. Launches in these groups
+      run the cutover; give each group a launch hook with HeartbeatTimeout 900
+      and DefaultResult ABANDON.
+
+  EgressEniIds:
+    Type: String
+    Default: ''
+    Description: >-
+      nat-only - comma-separated persistent egress ENI IDs, paired by position
+      with NatAsgNames: the interface each group's gateway holds at device 1.
+      Launched instances and their primary ENIs must be tagged
+      metaphor:stack-name=<GatewayStackName>.
+
+  # --- Auto-update -----------------------------------------------------------
+  AutoUpdateEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Periodically compare the gateways' AMI with the latest published Metaphor
+      Gateway AMI and roll the Auto Scaling groups by instance refresh. Only
+      meaningful when the launch template resolves the 'latest' AMI.
+
+  UpdateCheckSchedule:
+    Type: String
+    Default: 'rate(1 day)'
+    Description: EventBridge schedule for the update check, e.g. rate(1 day) or cron(0 2 * * ? *).
+
+  UpdateNotificationEmail:
+    Type: String
+    Default: ''
+    Description: >-
+      Email notified when a refresh starts or is cancelled after failed
+      cutovers. Empty to skip.
+
+Rules:
+  GwlbNeedsItsInputs:
+    RuleCondition: !Equals [!Ref Mode, gwlb]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AsgName, '']]
+        AssertDescription: gwlb mode needs AsgName.
+      - Assert: !Not [!Equals [!Ref PublicSubnets, '']]
+        AssertDescription: gwlb mode needs PublicSubnets.
+      - Assert: !Not [!Equals [!Ref PublicSecurityGroup, '']]
+        AssertDescription: gwlb mode needs PublicSecurityGroup.
+  NatOnlyNeedsItsInputs:
+    RuleCondition: !Equals [!Ref Mode, nat-only]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref NatAsgNames, '']]
+        AssertDescription: nat-only mode needs NatAsgNames.
+      - Assert: !Not [!Equals [!Ref EgressEniIds, '']]
+        AssertDescription: nat-only mode needs EgressEniIds.
+
+Conditions:
+  IsGwlb: !Equals [!Ref Mode, gwlb]
+  IsNatOnly: !Equals [!Ref Mode, nat-only]
+  AutoUpdate: !Equals [!Ref AutoUpdateEnabled, 'true']
+  HasUpdateEmail: !And
+    - !Condition AutoUpdate
+    - !Not [!Equals [!Ref UpdateNotificationEmail, '']]
+
+Globals:
+  Function:
+    CodeUri: src/
+    Runtime: python3.12
+    Architectures:
+      - arm64
+
+Resources:
+  # ===========================================================================
+  # Gossip HMAC secret (both modes)
+  # ===========================================================================
+  GossipSecretLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${GatewayStackName}-gossip-secret'
+      RetentionInDays: 14
+
+  GossipSecretFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: GossipSecretLogGroup
+    Properties:
+      FunctionName: !Sub '${GatewayStackName}-gossip-secret'
+      Handler: gossip_secret.handler
+      Timeout: 30
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ssm:PutParameter
+                - ssm:DeleteParameter
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/flow/${GatewayStackName}/*'
+
+  # ===========================================================================
+  # gwlb: EIP/ENI manager and orphan cleanup
+  # ===========================================================================
+  EipManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsGwlb
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${GatewayStackName}-eip-manager'
+      RetentionInDays: 14
+
+  # Attaches a public ENI + Elastic IP to each instance on launch and migrates
+  # or releases it on terminate, driven by the group's lifecycle hooks.
+  EipManagerFunction:
+    Type: AWS::Serverless::Function
+    Condition: IsGwlb
+    DependsOn: EipManagerLogGroup
+    Properties:
+      FunctionName: !Sub '${GatewayStackName}-eip-manager'
+      Handler: eip_manager.handler
+      Timeout: 600
+      MemorySize: 256
+      Environment:
+        Variables:
+          PUBLIC_SUBNETS: !Ref PublicSubnets
+          PUBLIC_SECURITY_GROUP: !Ref PublicSecurityGroup
+          ASG_NAME: !Ref AsgName
+          STACK_NAME: !Ref GatewayStackName
+          EIP_ALLOCATION_IDS: !Ref EipAllocationIds
+          EIPS_PER_AZ: !Ref EipsPerAz
+          ENI_DEVICE_INDEX: '1'
+          DISABLE_SRC_DEST_CHECK: 'true'
+          TAG_NAMESPACE: metaphor
+          TARGET_GROUP_ARN: !Ref TargetGroupArn
+          TARGET_PORT: '6081'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            # ENI/EIP actions cannot be resource-scoped at create time: the
+            # resource does not exist yet when CreateNetworkInterface /
+            # AllocateAddress are called.
+            - Effect: Allow
+              Action:
+                - ec2:CreateNetworkInterface
+                - ec2:DeleteNetworkInterface
+                - ec2:DescribeNetworkInterfaces
+                - ec2:AttachNetworkInterface
+                - ec2:DetachNetworkInterface
+                - ec2:ModifyNetworkInterfaceAttribute
+                - ec2:DescribeInstances
+                - ec2:DescribeSubnets
+                - ec2:DescribeAddresses
+                - ec2:AllocateAddress
+                - ec2:ReleaseAddress
+                - ec2:AssociateAddress
+                - ec2:DisassociateAddress
+                - ec2:CreateTags
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - autoscaling:CompleteLifecycleAction
+                - autoscaling:DescribeAutoScalingGroups
+              Resource: '*'
+            # The terminating instance is deregistered from the GWLB target
+            # group before its EIP is migrated, so connections drain first.
+            - Effect: Allow
+              Action:
+                - elasticloadbalancing:DeregisterTargets
+                - elasticloadbalancing:DescribeTargetHealth
+              Resource: '*'
+      Events:
+        Lifecycle:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.autoscaling
+              detail-type:
+                - EC2 Instance-launch Lifecycle Action
+                - EC2 Instance-terminate Lifecycle Action
+              detail:
+                AutoScalingGroupName:
+                  - !Ref AsgName
+
+  EipCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsGwlb
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${GatewayStackName}-eip-cleanup'
+      RetentionInDays: 14
+
+  # Custom resource provider: on stack delete, releases EIPs and deletes managed
+  # ENIs tagged metaphor:stack-name=<StackName property>.
+  EipCleanupFunction:
+    Type: AWS::Serverless::Function
+    Condition: IsGwlb
+    DependsOn: EipCleanupLogGroup
+    Properties:
+      FunctionName: !Sub '${GatewayStackName}-eip-cleanup'
+      Handler: eip_cleanup.handler
+      Timeout: 300
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeAddresses
+                - ec2:DisassociateAddress
+                - ec2:ReleaseAddress
+                - ec2:DescribeNetworkInterfaces
+                - ec2:DetachNetworkInterface
+                - ec2:DeleteNetworkInterface
+              Resource: '*'
+
+  # ===========================================================================
+  # NAT-only: persistent egress interface cutover
+  # ===========================================================================
+  NatCutoverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsNatOnly
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${GatewayStackName}-nat-cutover'
+      RetentionInDays: 14
+
+  # Moves each group's egress ENI onto its new gateway inside the launch
+  # lifecycle. Runs OUTSIDE the VPC on purpose: from a private subnet its only
+  # path to the EC2 and Auto Scaling APIs would be the gateway whose ENI it is
+  # moving. The launch hook's HeartbeatTimeout should be 900s; the function
+  # heartbeats while it waits.
+  NatCutoverFunction:
+    Type: AWS::Serverless::Function
+    Condition: IsNatOnly
+    DependsOn: NatCutoverLogGroup
+    Properties:
+      FunctionName: !Sub '${GatewayStackName}-nat-cutover'
+      Handler: nat_cutover.handler
+      Timeout: 900
+      Environment:
+        Variables:
+          NAT_ASG_NAMES: !Ref NatAsgNames
+          EGRESS_ENI_IDS: !Ref EgressEniIds
+          EGRESS_DEVICE_INDEX: '1'
+          NOTIFY_TOPIC_ARN: !If [AutoUpdate, !Ref AmiUpdateTopic, '']
+      # No retries: a second concurrent run would race the first over the same
+      # interface. A run that never completes the hook leaves it to the hook's
+      # DefaultResult ABANDON, which is the safe outcome.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeNetworkInterfaces
+              Resource: '*'
+            # SourceDestCheck on the new instance's primary interface.
+            - Effect: Allow
+              Action: ec2:ModifyNetworkInterfaceAttribute
+              Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+              Condition:
+                StringEquals:
+                  ec2:ResourceTag/metaphor:stack-name: !Ref GatewayStackName
+            # Attach/detach: exactly the egress interfaces, and only to tagged
+            # gateway instances. A list parameter can only be turned into ARNs
+            # with Fn::Join, whose delimiter must be a literal, hence the region
+            # and account wildcards; the ENI IDs pin every element.
+            - Effect: Allow
+              Action:
+                - ec2:AttachNetworkInterface
+                - ec2:DetachNetworkInterface
+              Resource: !Split
+                - ','
+                - !Sub
+                  - 'arn:aws:ec2:*:*:network-interface/${Enis}'
+                  - Enis: !Join
+                      - ',arn:aws:ec2:*:*:network-interface/'
+                      - !Split [',', !Ref EgressEniIds]
+            - Effect: Allow
+              Action:
+                - ec2:AttachNetworkInterface
+                - ec2:DetachNetworkInterface
+              Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+              Condition:
+                StringEquals:
+                  ec2:ResourceTag/metaphor:stack-name: !Ref GatewayStackName
+            # CancelInstanceRefresh: a refresh whose replacements keep failing
+            # their cutover is stopped rather than left to churn.
+            - Effect: Allow
+              Action:
+                - autoscaling:CompleteLifecycleAction
+                - autoscaling:RecordLifecycleActionHeartbeat
+                - autoscaling:CancelInstanceRefresh
+              Resource: !Split
+                - ','
+                - !Sub
+                  - 'arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/${Names}'
+                  - Names: !Join
+                      - ',arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/'
+                      - !Split [',', !Ref NatAsgNames]
+            - Effect: Allow
+              Action:
+                - autoscaling:DescribeInstanceRefreshes
+                - autoscaling:DescribeScalingActivities
+              Resource: '*'
+            - !If
+              - AutoUpdate
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AmiUpdateTopic
+              - !Ref AWS::NoValue
+      Events:
+        Lifecycle:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.autoscaling
+              detail-type:
+                - EC2 Instance-launch Lifecycle Action
+              detail:
+                AutoScalingGroupName: !Split [',', !Ref NatAsgNames]
+
+  # ===========================================================================
+  # AMI auto-update (both modes)
+  # ===========================================================================
+  AmiUpdateTopic:
+    Type: AWS::SNS::Topic
+    Condition: AutoUpdate
+    Properties:
+      TopicName: !Sub '${GatewayStackName}-ami-updates'
+      Tags:
+        - Key: metaphor:stack-name
+          Value: !Ref GatewayStackName
+
+  AmiUpdateTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasUpdateEmail
+    Properties:
+      TopicArn: !Ref AmiUpdateTopic
+      Protocol: email
+      Endpoint: !Ref UpdateNotificationEmail
+
+  AmiUpdaterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: AutoUpdate
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${GatewayStackName}-ami-updater'
+      RetentionInDays: 14
+
+  # Starts an instance refresh on each group whose instances are behind the
+  # latest published AMI. In NAT-only the replacement launches first (max 200%)
+  # and the cutover moves the egress interface onto it.
+  AmiUpdaterFunction:
+    Type: AWS::Serverless::Function
+    Condition: AutoUpdate
+    DependsOn: AmiUpdaterLogGroup
+    Properties:
+      FunctionName: !Sub '${GatewayStackName}-ami-updater'
+      Handler: ami_updater.handler
+      Timeout: 120
+      Environment:
+        Variables:
+          ASG_NAMES: !If [IsGwlb, !Ref AsgName, !Ref NatAsgNames]
+          SSM_PARAM: '/aws/service/marketplace/prod-34beghzp66pd4/latest'
+          TOPIC_ARN: !Ref AmiUpdateTopic
+          REFRESH_PREFERENCES: !If
+            - IsGwlb
+            - '{"MinHealthyPercentage": 100, "InstanceWarmup": 120}'
+            - '{"MinHealthyPercentage": 100, "MaxHealthyPercentage": 200, "InstanceWarmup": 60}'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/marketplace/*'
+            # Describe* calls take no resource-level permissions: scoped to the
+            # ASG ARN they are denied, and the updater never refreshes.
+            - Effect: Allow
+              Action:
+                - autoscaling:DescribeAutoScalingGroups
+                - autoscaling:DescribeInstanceRefreshes
+                - ec2:DescribeInstances
+              Resource: '*'
+            - Effect: Allow
+              Action: autoscaling:StartInstanceRefresh
+              Resource: !Split
+                - ','
+                - !Sub
+                  - 'arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/${Names}'
+                  - Names: !Join
+                      - ',arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/'
+                      - !Split [',', !If [IsGwlb, !Ref AsgName, !Ref NatAsgNames]]
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref AmiUpdateTopic
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref UpdateCheckSchedule
+
+Outputs:
+  GossipSecretServiceToken:
+    Description: >-
+      ServiceToken for a Custom::GossipSecret with ParameterName
+      /flow/<GatewayStackName>/gossip-hmac.
+    Value: !GetAtt GossipSecretFunction.Arn
+
+  EipCleanupServiceToken:
+    Condition: IsGwlb
+    Description: >-
+      ServiceToken for a Custom::EipCleanup with StackName <GatewayStackName>.
+      Make the gateway Auto Scaling group depend on it so the sweep runs after
+      the group is gone.
+    Value: !GetAtt EipCleanupFunction.Arn
+
+  EipManagerFunctionArn:
+    Condition: IsGwlb
+    Value: !GetAtt EipManagerFunction.Arn
+
+  NatCutoverFunctionArn:
+    Condition: IsNatOnly
+    Value: !GetAtt NatCutoverFunction.Arn
+
+  AmiUpdateTopicArn:
+    Condition: AutoUpdate
+    Description: SNS topic for AMI update and cancelled-refresh notifications.
+    Value: !Ref AmiUpdateTopic
