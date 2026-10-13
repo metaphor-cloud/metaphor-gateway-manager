@@ -10,6 +10,9 @@
 # (true|false), AWS_REGION.
 set -euo pipefail
 
+# The Serverless Application Repository API throttles readily.
+export AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=10
+
 : "${SAM_PACKAGE_BUCKET:?}" "${APP_NAME:?}" "${AWS_REGION:?}"
 cd "$(dirname "$0")/.."
 
@@ -31,12 +34,10 @@ if [ "$status" -ne 0 ]; then
 fi
 
 if [ "${MAKE_PUBLIC:-false}" = "true" ]; then
-  app_id=$(aws serverlessrepo list-applications \
-    --query "Applications[?Name=='$APP_NAME'].ApplicationId | [0]" --output text)
-  if [ -z "$app_id" ] || [ "$app_id" = "None" ]; then
-    echo "Could not resolve the ApplicationId for $APP_NAME; not granting public Deploy." >&2
-    exit 1
-  fi
+  # The ApplicationId is derived, not looked up: ListApplications is throttled
+  # hard enough to fail a publish.
+  account=$(aws sts get-caller-identity --query Account --output text)
+  app_id="arn:aws:serverlessrepo:${AWS_REGION}:${account}:applications/${APP_NAME}"
   aws serverlessrepo put-application-policy \
     --application-id "$app_id" \
     --statements Principals='*',Actions='Deploy'
