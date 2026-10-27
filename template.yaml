@@ -18,7 +18,7 @@ Metadata:
     ReadmeUrl: README.md
     Labels: ['metaphor', 'nat', 'gwlb', 'eip', 'autoscaling', 'lifecycle-hook']
     HomePageUrl: https://github.com/metaphor-cloud/metaphor-gateway-manager
-    SemanticVersion: 0.1.1
+    SemanticVersion: 0.2.0
     SourceCodeUrl: https://github.com/metaphor-cloud/metaphor-gateway-manager
 
   AWS::CloudFormation::Interface:
@@ -102,7 +102,9 @@ Parameters:
     Description: >-
       gwlb - Elastic IPs per AZ. 0 is single-ENI (no managed ENI or EIP); 1 is a
       stable per-AZ IP migrated to the successor on refresh; 2 or more is a
-      blue/green pool. Set the gateway's FLOW_EIPS_PER_AZ to the same value.
+      strict pool: a launch waits for a free slot rather than taking a transient
+      EIP, and the AMI updater refreshes terminate-first when an AZ's pool is
+      full. Set the gateway's FLOW_EIPS_PER_AZ to the same value.
 
   TargetGroupArn:
     Type: String
@@ -222,7 +224,9 @@ Resources:
       RetentionInDays: 14
 
   # Attaches a public ENI + Elastic IP to each instance on launch and migrates
-  # or releases it on terminate, driven by the group's lifecycle hooks.
+  # or releases it on terminate, driven by the group's lifecycle hooks. 900s:
+  # with EipsPerAz>=2 a launch can wait out the outgoing gateway's ELB draining
+  # for its pool slot, heartbeating the launch hook meanwhile.
   EipManagerFunction:
     Type: AWS::Serverless::Function
     Condition: IsGwlb
@@ -230,7 +234,7 @@ Resources:
     Properties:
       FunctionName: !Sub '${GatewayStackName}-eip-manager'
       Handler: eip_manager.handler
-      Timeout: 600
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -271,6 +275,7 @@ Resources:
             - Effect: Allow
               Action:
                 - autoscaling:CompleteLifecycleAction
+                - autoscaling:RecordLifecycleActionHeartbeat
                 - autoscaling:DescribeAutoScalingGroups
               Resource: '*'
             # The terminating instance is deregistered from the GWLB target
@@ -476,6 +481,8 @@ Resources:
           ASG_NAMES: !If [IsGwlb, !Ref AsgName, !Ref NatAsgNames]
           SSM_PARAM: '/aws/service/marketplace/prod-34beghzp66pd4/latest'
           TOPIC_ARN: !Ref AmiUpdateTopic
+          # A full EIP pool turns the refresh terminate-first (ami_updater).
+          EIPS_PER_AZ: !If [IsGwlb, !Ref EipsPerAz, '0']
           REFRESH_PREFERENCES: !If
             - IsGwlb
             - '{"MinHealthyPercentage": 100, "InstanceWarmup": 120}'

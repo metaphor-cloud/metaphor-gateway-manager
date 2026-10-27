@@ -19,8 +19,9 @@ PREFS = {"MinHealthyPercentage": 100, "MaxHealthyPercentage": 200, "InstanceWarm
 
 
 class FakeAsg:
-    def __init__(self, groups, refresh_status=None, fail=()):
+    def __init__(self, groups, refresh_status=None, fail=(), azs=None):
         self.groups = groups
+        self.azs = azs or {}
         self.refresh_status = refresh_status or {}
         self.fail = set(fail)
         self.started = []
@@ -31,7 +32,13 @@ class FakeAsg:
             raise RuntimeError("AccessDenied")
         if name not in self.groups:
             return {"AutoScalingGroups": []}
-        return {"AutoScalingGroups": [{"Instances": [{"InstanceId": i} for i in self.groups[name]]}]}
+        ids = self.groups[name]
+        azs = self.azs.get(name, ["us-east-1a"] * len(ids))
+        return {"AutoScalingGroups": [{
+            "AutoScalingGroupName": name,
+            "DesiredCapacity": len(ids),
+            "Instances": [{"InstanceId": i, "AvailabilityZone": az} for i, az in zip(ids, azs)],
+        }]}
 
     def describe_instance_refreshes(self, AutoScalingGroupName, MaxRecords):
         status = self.refresh_status.get(AutoScalingGroupName)
@@ -57,13 +64,16 @@ def env():
         yield SimpleNamespace(ec2=ec2, ssm=ssm, sns=boto3.client("sns"), old=old, new=new, launch=launch)
 
 
-def cfg(names, topic=""):
-    return app.Config(env={
+def cfg(names, topic="", eips_per_az=None, prefs=PREFS):
+    env = {
         "ASG_NAMES": names,
         "SSM_PARAM": PARAM,
         "TOPIC_ARN": topic,
-        "REFRESH_PREFERENCES": json.dumps(PREFS),
-    })
+        "REFRESH_PREFERENCES": json.dumps(prefs),
+    }
+    if eips_per_az is not None:
+        env["EIPS_PER_AZ"] = str(eips_per_az)
+    return app.Config(env=env)
 
 
 def clients(env, asg):
@@ -123,3 +133,37 @@ def test_publishes_the_refresh_to_the_topic(env):
     body = json.loads(sqs.receive_message(QueueUrl=queue)["Messages"][0]["Body"])
     assert "refresh-nat-a" in body["Message"]
     assert env.new in body["Message"]
+
+
+GWLB_PREFS = {"MinHealthyPercentage": 100, "InstanceWarmup": 120}
+
+
+def test_full_eip_pool_refreshes_terminate_first_one_at_a_time(env):
+    # Two gateways in one AZ holding both pool EIPs: launching first would leave
+    # the replacement with no slot, so the outgoing gateway must go first.
+    asg = FakeAsg({"gwlb": [env.launch(env.old), env.launch(env.old)]})
+    app.handler({}, None, cfg("gwlb", eips_per_az=2, prefs=GWLB_PREFS), clients(env, asg))
+    assert asg.started == [("gwlb", {"MinHealthyPercentage": 50, "MaxHealthyPercentage": 100,
+                                     "InstanceWarmup": 120})]
+
+
+def test_eip_pool_with_headroom_keeps_launch_first(env):
+    asg = FakeAsg({"gwlb": [env.launch(env.old), env.launch(env.old)]},
+                  azs={"gwlb": ["us-east-1a", "us-east-1b"]})
+    app.handler({}, None, cfg("gwlb", eips_per_az=2, prefs=GWLB_PREFS), clients(env, asg))
+    assert asg.started == [("gwlb", GWLB_PREFS)]
+
+
+@pytest.mark.parametrize("desired,min_healthy", [(2, 50), (3, 67), (4, 75), (10, 90)])
+def test_terminate_first_keeps_all_but_one_gateway(env, desired, min_healthy):
+    asg = FakeAsg({"gwlb": [env.launch(env.old) for _ in range(desired)]})
+    app.handler({}, None, cfg("gwlb", eips_per_az=2, prefs=GWLB_PREFS), clients(env, asg))
+    assert asg.started[0][1]["MinHealthyPercentage"] == min_healthy
+    assert asg.started[0][1]["MaxHealthyPercentage"] == 100
+
+
+@pytest.mark.parametrize("eips_per_az", [None, 0, 1])
+def test_without_an_eip_pool_preferences_are_unchanged(env, eips_per_az):
+    asg = FakeAsg({"gwlb": [env.launch(env.old), env.launch(env.old)]})
+    app.handler({}, None, cfg("gwlb", eips_per_az=eips_per_az, prefs=GWLB_PREFS), clients(env, asg))
+    assert asg.started == [("gwlb", GWLB_PREFS)]

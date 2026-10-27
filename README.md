@@ -30,7 +30,7 @@ GatewayManager:
   Properties:
     Location:
       ApplicationId: arn:aws:serverlessrepo:us-east-1:189292791360:applications/metaphor-gateway-manager
-      SemanticVersion: 0.1.1
+      SemanticVersion: 0.2.0
     Parameters:
       Mode: gwlb
       GatewayStackName: !Ref AWS::StackName
@@ -58,6 +58,14 @@ Make the gateway Auto Scaling group depend on `GatewayManager` and `EipCleanup`,
 so its first lifecycle hooks reach a function that exists and the cleanup sweep
 runs after the group is gone on delete.
 
+`EipsPerAz` 2 or more is a strict pool: the gateways only ever egress from the
+EIPs in `EipAllocationIds`. A launch that finds every slot in its AZ held waits
+for one to free (an outgoing gateway returns its slot in its terminate hook),
+heartbeating the launch hook, and is abandoned if none frees within the
+function's 15 minutes. Size the pool to the gateways you run per AZ; when an
+AZ's pool is full the AMI updater refreshes terminate-first, one gateway at a
+time, instead of launching the replacement first.
+
 NAT-only, one Auto Scaling group of one per egress ENI:
 
 ```yaml
@@ -66,7 +74,7 @@ GatewayManager:
   Properties:
     Location:
       ApplicationId: arn:aws:serverlessrepo:us-east-1:189292791360:applications/metaphor-gateway-manager
-      SemanticVersion: 0.1.1
+      SemanticVersion: 0.2.0
     Parameters:
       Mode: nat-only
       GatewayStackName: !Ref AWS::StackName

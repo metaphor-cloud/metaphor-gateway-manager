@@ -17,7 +17,11 @@ The egress-IP contract is governed by ``EIPS_PER_AZ``:
   >=2  N-slot pool per AZ (blue/green). A new instance claims a currently-free
        pool slot; the old instance keeps its slot until terminate, then
        returns it to the pool. No transient EIPs. Egress IP is always one of
-       the configured pool EIPs.
+       the configured pool EIPs. When every slot is held - a terminate-first
+       replacement launches while the outgoing instance is still draining -
+       the launch waits inside its lifecycle hook for a slot to free, and
+       ABANDONs if none does before the function's deadline. The instance
+       therefore only enters service holding a pool EIP.
 
 ``EIP_ALLOCATION_IDS`` is a flat list partitioned by ``PUBLIC_SUBNETS`` order:
 the first ``EIPS_PER_AZ`` allocations belong to subnet 0, the next
@@ -32,9 +36,23 @@ import os
 import time
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# Pool wait (EipsPerAz>=2). The launch hook's HeartbeatTimeout is 300s, so a
+# heartbeat every 60s keeps it alive with margin; the deadline margin leaves the
+# function time to clean up and complete the hook before Lambda kills it.
+POOL_POLL_SECONDS = 10
+HEARTBEAT_SECONDS = 60
+DEADLINE_MARGIN_SECONDS = 60
+# Used when the handler has no Lambda context to read a deadline from.
+DEFAULT_POOL_WAIT_SECONDS = 600
+
+
+class PoolExhausted(Exception):
+    """No pool slot freed before the launch deadline."""
 
 
 class Config:
@@ -123,19 +141,65 @@ def create_and_attach_eni(cfg, clients, iid, subnet_id, tags):
     return ni
 
 
-def find_free_pool_eip(clients, pool):
-    """Return the AllocationId of the first unassociated EIP in the pool, else None."""
+def find_free_pool_eips(clients, pool):
+    """Return the AllocationIds of the pool's unassociated EIPs, in pool order."""
     if not pool:
-        return None
+        return []
     try:
         addrs = clients.ec2.describe_addresses(AllocationIds=pool)["Addresses"]
     except Exception as e:
         logger.error("describe_addresses for pool %s failed: %s", pool, e)
-        return None
-    for a in addrs:
-        if not a.get("AssociationId"):
-            return a["AllocationId"]
+        return []
+    free = {a["AllocationId"] for a in addrs if not a.get("AssociationId")}
+    return [p for p in pool if p in free]
+
+
+def claim_free_pool_eip(clients, pool, ni):
+    """Associate the first free pool EIP with ``ni`` and return its AllocationId,
+    or None when every slot is held.
+
+    AllowReassociation=False makes the claim atomic: two launches in one AZ can
+    both see the same slot free, and with reassociation allowed the second would
+    silently take it from the first. Here the loser gets
+    Resource.AlreadyAssociated and moves on to the next slot."""
+    for alloc_id in find_free_pool_eips(clients, pool):
+        try:
+            clients.ec2.associate_address(AllocationId=alloc_id, NetworkInterfaceId=ni, AllowReassociation=False)
+            return alloc_id
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "Resource.AlreadyAssociated":
+                raise
+            logger.info("pool EIP %s was claimed concurrently; trying the next slot (reason=slot_race)", alloc_id)
     return None
+
+
+def wait_for_pool_eip(clients, pool, ni, iid, az, heartbeat, deadline):
+    """Block until a pool slot frees and is claimed for ``ni``; raise
+    PoolExhausted at ``deadline`` (a time.monotonic() value).
+
+    A terminate-first replacement launches while the outgoing instance still
+    holds its slot through ELB draining and its terminate hook. The terminate
+    hook returns the slot to the pool, so waiting here, rather than allocating a
+    transient, keeps the egress IP set to exactly the configured pool."""
+    started = time.monotonic()
+    last_beat = started
+    logger.info("pool in %s fully held (%d EIP(s)); %s waiting for a slot to free (reason=pool_wait)",
+                az, len(pool), iid)
+    while True:
+        alloc_id = claim_free_pool_eip(clients, pool, ni)
+        if alloc_id:
+            logger.info("claimed pool EIP %s for %s in %s after %.0fs", alloc_id, iid, az,
+                        time.monotonic() - started)
+            return alloc_id
+        now = time.monotonic()
+        if now + POOL_POLL_SECONDS >= deadline:
+            logger.error("no pool EIP freed in %s within %.0fs for %s (reason=pool_exhausted)",
+                         az, now - started, iid)
+            raise PoolExhausted(f"no pool EIP freed in {az} for {iid}")
+        if heartbeat and now - last_beat >= HEARTBEAT_SECONDS:
+            heartbeat()
+            last_beat = now
+        time.sleep(POOL_POLL_SECONDS)
 
 
 def allocate_transient(cfg, clients, iid, az):
@@ -151,7 +215,7 @@ def allocate_transient(cfg, clients, iid, az):
     return eip["AllocationId"]
 
 
-def launch(cfg, clients, iid):
+def launch(cfg, clients, iid, heartbeat=None, deadline=None):
     # EipsPerAz=0 is SINGLE-ENI mode: the gateway runs on its primary ENI in a
     # public subnet and uses the auto-assigned public IPv4, so there is no managed
     # ENI to create and no address to associate. Nothing to do here.
@@ -175,10 +239,13 @@ def launch(cfg, clients, iid):
     pool = az_map[az]["pool"]
     ni = create_and_attach_eni(cfg, clients, iid, subnet_id, make_tags(cfg, iid))
     try:
-        alloc_id = find_free_pool_eip(clients, pool)
+        alloc_id = claim_free_pool_eip(clients, pool, ni)
         if alloc_id:
-            logger.info("claiming pool EIP %s for %s in %s", alloc_id, iid, az)
-            clients.ec2.associate_address(AllocationId=alloc_id, NetworkInterfaceId=ni, AllowReassociation=True)
+            logger.info("claimed pool EIP %s for %s in %s", alloc_id, iid, az)
+        elif cfg.eips_per_az >= 2 and pool:
+            if deadline is None:
+                deadline = time.monotonic() + DEFAULT_POOL_WAIT_SECONDS
+            alloc_id = wait_for_pool_eip(clients, pool, ni, iid, az, heartbeat, deadline)
         else:
             if pool:
                 logger.info("pool in %s exhausted (%d EIP(s) all associated); allocating transient for %s",
@@ -367,9 +434,21 @@ def handler(event, context):
     # partial launch left - and launch a replacement. A failed TERMINATE still
     # CONTINUEs: holding a dying instance cannot make its cleanup succeed.
     result = "CONTINUE"
+
+    def heartbeat():
+        try:
+            clients.asg.record_lifecycle_action_heartbeat(
+                LifecycleHookName=hook, AutoScalingGroupName=asg, InstanceId=iid)
+        except Exception as e:
+            logger.warning("lifecycle heartbeat for %s failed (reason=heartbeat_failed): %s", iid, e)
+
+    deadline = None
+    if context is not None:
+        deadline = (time.monotonic() + context.get_remaining_time_in_millis() / 1000
+                    - DEADLINE_MARGIN_SECONDS)
     try:
         if launching:
-            launch(cfg, clients, iid)
+            launch(cfg, clients, iid, heartbeat=heartbeat, deadline=deadline)
         else:
             terminate(cfg, clients, iid)
     except Exception as e:

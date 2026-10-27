@@ -11,11 +11,18 @@ NAT-only gateways (one group of one per egress interface). In NAT-only the
 preferences are MinHealthyPercentage 100 with MaxHealthyPercentage 200: the
 replacement launches first and the cutover function moves the egress interface
 onto it, so connections open through the old gateway reset at the switch.
+
+A gwlb fleet with an Elastic IP pool (EIPS_PER_AZ >= 2) can only launch first
+while every AZ has a free pool slot: the EIP manager makes a new gateway wait
+for a slot rather than egress from a transient. When some AZ already runs as
+many gateways as it has slots, the refresh is turned terminate-first, one
+gateway at a time, so the outgoing gateway's slot frees for its replacement.
 """
 
 import json
 import logging
 import os
+from collections import Counter
 
 import boto3
 
@@ -30,6 +37,7 @@ class Config:
         self.ssm_param = env["SSM_PARAM"]
         self.topic_arn = env.get("TOPIC_ARN", "")
         self.preferences = json.loads(env["REFRESH_PREFERENCES"])
+        self.eips_per_az = int(env.get("EIPS_PER_AZ", "0") or "0")
 
 
 class Clients:
@@ -56,6 +64,28 @@ def refresh_in_progress(clients, name):
     r = clients.asg.describe_instance_refreshes(AutoScalingGroupName=name, MaxRecords=1)
     refreshes = r.get("InstanceRefreshes", [])
     return bool(refreshes) and refreshes[0]["Status"] in ("Pending", "InProgress", "Cancelling")
+
+
+def refresh_preferences(cfg, group):
+    """REFRESH_PREFERENCES, made terminate-first when an EIP pool is full."""
+    prefs = dict(cfg.preferences)
+    if cfg.eips_per_az < 2:
+        return prefs
+    per_az = Counter(i["AvailabilityZone"] for i in group.get("Instances", []))
+    fullest = max(per_az.values(), default=0)
+    if fullest < cfg.eips_per_az:
+        return prefs
+    desired = max(int(group.get("DesiredCapacity", 1)), 1)
+    # Keep desired-1 healthy so exactly one gateway is out at a time. Rounded up
+    # (100 - floor(100/N)): whichever way Auto Scaling rounds the percentage to
+    # instances, it never takes out two, and it always replaces at least one.
+    # Max 100 is what makes it terminate before it launches.
+    prefs["MinHealthyPercentage"] = min(100 - 100 // desired, 99)
+    prefs["MaxHealthyPercentage"] = 100
+    logger.info("%s has %d gateway(s) in an AZ with %d pool EIP(s); refreshing terminate-first "
+                "one at a time (reason=pool_full)", group.get("AutoScalingGroupName", "group"),
+                fullest, cfg.eips_per_az)
+    return prefs
 
 
 def notify(cfg, clients, name, latest, refresh_id):
@@ -90,7 +120,7 @@ def update_group(cfg, clients, name, latest):
         logger.info("%s already has an instance refresh in progress; skipping (reason=refresh_in_progress)", name)
         return {"status": "refresh_in_progress"}
     refresh_id = clients.asg.start_instance_refresh(
-        AutoScalingGroupName=name, Preferences=cfg.preferences)["InstanceRefreshId"]
+        AutoScalingGroupName=name, Preferences=refresh_preferences(cfg, groups[0]))["InstanceRefreshId"]
     logger.info("started instance refresh %s to roll %s to %s", refresh_id, name, latest)
     notify(cfg, clients, name, latest, refresh_id)
     return {"status": "refresh_started", "ami_id": latest, "refresh_id": refresh_id}

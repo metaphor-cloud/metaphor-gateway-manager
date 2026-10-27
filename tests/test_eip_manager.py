@@ -413,3 +413,157 @@ def test_handler_dispatches_terminate(monkeypatch):
     term.assert_called_once()
     assert term.call_args[0][2] == "i-xyz"
     fake.asg.complete_lifecycle_action.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# pool wait (EipsPerAz>=2)
+# --------------------------------------------------------------------------- #
+
+def _pool_of_two_fully_held(clients):
+    """One AZ, EipsPerAz=2, both pool EIPs held by running gateways."""
+    _, sg, subnets = setup_network(clients.ec2, [AZ_A])
+    eips = alloc_eips(clients.ec2, 2)
+    cfg = make_cfg(
+        public_sg=sg, public_subnets=subnets[0], eips_per_az=2,
+        eip_allocation_ids=",".join(eips),
+    )
+    holders = [run_instance(clients.ec2, subnets[0]) for _ in range(2)]
+    for iid in holders:
+        app.launch(cfg, clients, iid)
+    return cfg, subnets, eips, holders
+
+
+def test_pool_launch_waits_for_a_slot_instead_of_a_transient(aws, monkeypatch):
+    # Terminate-first replacement: the new gateway launches while the outgoing
+    # one still holds its slot. It must wait and take that slot, not a transient.
+    clients = app.Clients()
+    cfg, subnets, eips, holders = _pool_of_two_fully_held(clients)
+    outgoing_eip = next(a for a in eips if addr(clients.ec2, a)["NetworkInterfaceId"]
+                        == app.get_managed_eni(cfg, clients, holders[0])["NetworkInterfaceId"])
+    sleeps = []
+
+    def outgoing_terminates(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            app.terminate(cfg, clients, holders[0])
+
+    monkeypatch.setattr(app.time, "sleep", outgoing_terminates)
+    new = run_instance(clients.ec2, subnets[0])
+
+    app.launch(cfg, clients, new, deadline=app.time.monotonic() + 600)
+
+    assert all_alloc_ids(clients.ec2) == set(eips)
+    assert addr(clients.ec2, outgoing_eip)["NetworkInterfaceId"] == \
+        app.get_managed_eni(cfg, clients, new)["NetworkInterfaceId"]
+    assert len(sleeps) == 2
+
+
+def test_pool_launch_heartbeats_while_waiting(aws, monkeypatch):
+    clients = app.Clients()
+    cfg, subnets, _, holders = _pool_of_two_fully_held(clients)
+    monkeypatch.setattr(app, "HEARTBEAT_SECONDS", 0)
+    calls = []
+
+    def sleep(_):
+        calls.append(1)
+        if len(calls) == 3:
+            app.terminate(cfg, clients, holders[1])
+
+    monkeypatch.setattr(app.time, "sleep", sleep)
+    heartbeat = Mock()
+
+    app.launch(cfg, clients, run_instance(clients.ec2, subnets[0]),
+               heartbeat=heartbeat, deadline=app.time.monotonic() + 600)
+
+    assert heartbeat.call_count == 3
+
+
+def test_pool_launch_fails_when_no_slot_frees_by_the_deadline(aws, monkeypatch):
+    # Fail closed: no transient, the ENI is cleaned up, and the raise makes the
+    # handler ABANDON so the instance never enters service off-pool.
+    clients = app.Clients()
+    cfg, subnets, eips, _ = _pool_of_two_fully_held(clients)
+    monkeypatch.setattr(app.time, "sleep", Mock())
+    new = run_instance(clients.ec2, subnets[0])
+
+    with pytest.raises(app.PoolExhausted):
+        app.launch(cfg, clients, new, deadline=app.time.monotonic() + 1)
+
+    assert all_alloc_ids(clients.ec2) == set(eips)
+    assert app.get_managed_eni(cfg, clients, new) is None
+
+
+def test_pool_exhausted_launch_is_abandoned_by_the_handler(aws, monkeypatch):
+    clients = app.Clients()
+    cfg, subnets, _, _ = _pool_of_two_fully_held(clients)
+    monkeypatch.setattr(app.time, "sleep", Mock())
+    monkeypatch.setattr(app, "DEADLINE_MARGIN_SECONDS", 0)
+    clients.asg = Mock()
+    new = run_instance(clients.ec2, subnets[0])
+    context = SimpleNamespace(get_remaining_time_in_millis=lambda: 1000)
+
+    with patch.object(app, "Clients", return_value=clients), \
+            patch.object(app, "Config", return_value=cfg):
+        app.handler(_hook_event(new, "launch-hook", "LAUNCHING"), context)
+
+    assert clients.asg.complete_lifecycle_action.call_args.kwargs["LifecycleActionResult"] == "ABANDON"
+
+
+def test_handler_heartbeats_the_launch_hook(monkeypatch):
+    fake = _fake_clients(monkeypatch)
+    monkeypatch.setattr(app, "launch", lambda cfg, clients, iid, heartbeat, deadline: heartbeat())
+
+    app.handler(_hook_event("i-abc", "launch-hook", "LAUNCHING"), None)
+
+    fake.asg.record_lifecycle_action_heartbeat.assert_called_once_with(
+        LifecycleHookName="launch-hook", AutoScalingGroupName="test-asg", InstanceId="i-abc")
+
+
+def test_handler_derives_the_deadline_from_the_lambda_context(monkeypatch):
+    _fake_clients(monkeypatch)
+    launch = Mock()
+    monkeypatch.setattr(app, "launch", launch)
+    context = SimpleNamespace(get_remaining_time_in_millis=lambda: 900_000)
+
+    before = app.time.monotonic()
+    app.handler(_hook_event("i-abc", "launch-hook", "LAUNCHING"), context)
+
+    deadline = launch.call_args.kwargs["deadline"]
+    assert before + 900 - app.DEADLINE_MARGIN_SECONDS - 1 <= deadline <= \
+        app.time.monotonic() + 900 - app.DEADLINE_MARGIN_SECONDS
+
+
+def test_claim_skips_a_slot_taken_concurrently(aws, monkeypatch):
+    # Two launches saw the same slot free; the loser must not steal it.
+    clients = app.Clients()
+    _, sg, subnets = setup_network(clients.ec2, [AZ_A])
+    eips = alloc_eips(clients.ec2, 2)
+    cfg = make_cfg(public_sg=sg, public_subnets=subnets[0], eips_per_az=2,
+                   eip_allocation_ids=",".join(eips))
+    winner = run_instance(clients.ec2, subnets[0])
+    app.launch(cfg, clients, winner)
+    winner_eni = app.get_managed_eni(cfg, clients, winner)["NetworkInterfaceId"]
+    taken = next(a for a in eips if addr(clients.ec2, a).get("AssociationId"))
+    free = next(a for a in eips if a != taken)
+    loser_eni = clients.ec2.create_network_interface(SubnetId=subnets[0])["NetworkInterface"]["NetworkInterfaceId"]
+    # Stale view: both slots looked free when the loser listed them.
+    monkeypatch.setattr(app, "find_free_pool_eips", lambda clients, pool: [taken, free])
+
+    assert app.claim_free_pool_eip(clients, eips, loser_eni) == free
+    assert addr(clients.ec2, taken)["NetworkInterfaceId"] == winner_eni
+    assert addr(clients.ec2, free)["NetworkInterfaceId"] == loser_eni
+
+
+def test_eips_per_az_one_still_uses_a_transient(aws, monkeypatch):
+    # EipsPerAz=1 keeps its launch-first contract: transient now, migrated slot
+    # on terminate. It must not wait.
+    clients = app.Clients()
+    _, sg, subnets = setup_network(clients.ec2, [AZ_A])
+    (eip,) = alloc_eips(clients.ec2, 1)
+    cfg = make_cfg(public_sg=sg, public_subnets=subnets[0], eips_per_az=1, eip_allocation_ids=eip)
+    app.launch(cfg, clients, run_instance(clients.ec2, subnets[0]))
+    monkeypatch.setattr(app.time, "sleep", Mock(side_effect=AssertionError("must not wait")))
+
+    app.launch(cfg, clients, run_instance(clients.ec2, subnets[0]))
+
+    assert len(all_alloc_ids(clients.ec2)) == 2
