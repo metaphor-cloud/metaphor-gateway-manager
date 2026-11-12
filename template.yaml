@@ -3,7 +3,8 @@ Transform: AWS::Serverless-2016-10-31
 Description: >-
   Network by Metaphor manager: the Lambda functions a Network by Metaphor deployment
   needs (EIP/ENI lifecycle, NAT-only egress cutover, AMI auto-update, gossip
-  secret and orphan-cleanup custom resources), for nesting in your own
+  secret, network prefix list and orphan-cleanup custom resources), for nesting
+  in your own
   CloudFormation alongside the gateway's Auto Scaling groups.
 
 Metadata:
@@ -12,13 +13,14 @@ Metadata:
     Description: >-
       Lifecycle and maintenance Lambdas for Network by Metaphor: public ENI and
       Elastic IP management (gwlb), persistent egress interface cutover
-      (NAT-only), AMI auto-update, gossip HMAC secret and orphan cleanup.
+      (NAT-only), AMI auto-update, gossip HMAC secret, VPC and subnet prefix
+      lists for security groups, and orphan cleanup.
     Author: Metaphor
     LicenseUrl: LICENSE
     ReadmeUrl: README.md
     Labels: ['metaphor', 'nat', 'gwlb', 'eip', 'autoscaling', 'lifecycle-hook']
     HomePageUrl: https://github.com/metaphor-cloud/metaphor-gateway-manager
-    SemanticVersion: 0.2.0
+    SemanticVersion: 0.3.0
     SourceCodeUrl: https://github.com/metaphor-cloud/metaphor-gateway-manager
 
   AWS::CloudFormation::Interface:
@@ -212,6 +214,53 @@ Resources:
                 - ssm:PutParameter
                 - ssm:DeleteParameter
               Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/flow/${GatewayStackName}/*'
+
+  # ===========================================================================
+  # Network details (both modes): VPC and subnet CIDRs as managed prefix lists
+  # ===========================================================================
+  NetworkDetailsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${GatewayStackName}-network-details'
+      RetentionInDays: 14
+
+  NetworkDetailsFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: NetworkDetailsLogGroup
+    Properties:
+      FunctionName: !Sub '${GatewayStackName}-network-details'
+      Handler: network_details.handler
+      Timeout: 300
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeVpcs
+                - ec2:DescribeSubnets
+                - ec2:DescribeManagedPrefixLists
+                - ec2:GetManagedPrefixListEntries
+              Resource: '*'
+            - Effect: Allow
+              Action: ec2:CreateManagedPrefixList
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  'aws:RequestTag/metaphor:managed-by': network-details
+            - Effect: Allow
+              Action: ec2:CreateTags
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  'ec2:CreateAction': CreateManagedPrefixList
+            - Effect: Allow
+              Action:
+                - ec2:ModifyManagedPrefixList
+                - ec2:DeleteManagedPrefixList
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  'aws:ResourceTag/metaphor:managed-by': network-details
 
   # ===========================================================================
   # gwlb: EIP/ENI manager and orphan cleanup
@@ -525,6 +574,13 @@ Outputs:
       ServiceToken for a Custom::GossipSecret with ParameterName
       /flow/<GatewayStackName>/gossip-hmac.
     Value: !GetAtt GossipSecretFunction.Arn
+
+  NetworkDetailsServiceToken:
+    Description: >-
+      ServiceToken for a Custom::NetworkDetails with Name and exactly one of
+      VpcId or SubnetIds. Returns PrefixListId (a managed prefix list holding
+      those CIDRs) for security group rules, and Cidrs.
+    Value: !GetAtt NetworkDetailsFunction.Arn
 
   EipCleanupServiceToken:
     Condition: IsGwlb

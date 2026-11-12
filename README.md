@@ -10,6 +10,7 @@ runs from the same code package (`src/`), one module per entrypoint:
 | `eip_cleanup` | Custom resource: on stack delete, releases tagged EIPs and deletes managed ENIs left behind | gwlb |
 | `nat_cutover` | Moves each NAT-only group's persistent egress ENI onto its new gateway inside the launch lifecycle | nat-only |
 | `gossip_secret` | Custom resource: generates the gossip HMAC key as an SSM SecureString | both |
+| `network_details` | Custom resource: keeps a VPC's or subnets' IPv4 CIDRs in a managed prefix list for security group rules | both |
 | `ami_updater` | Scheduled: starts an instance refresh when the gateways are behind the latest published AMI | both |
 
 Network by Metaphor's AWS Marketplace templates ship the same modules inline,
@@ -53,6 +54,33 @@ EipCleanup:
     ServiceToken: !GetAtt GatewayManager.Outputs.EipCleanupServiceToken
     StackName: !Ref AWS::StackName
 ```
+
+Security group sources from the network's real ranges, not a typed-in CIDR:
+
+```yaml
+VpcPrefixList:
+  Type: Custom::NetworkDetails
+  Properties:
+    ServiceToken: !GetAtt GatewayManager.Outputs.NetworkDetailsServiceToken
+    Name: !Sub '${AWS::StackName}-vpc'
+    VpcId: !Ref VpcId
+
+GwlbSubnetPrefixList:
+  Type: Custom::NetworkDetails
+  Properties:
+    ServiceToken: !GetAtt GatewayManager.Outputs.NetworkDetailsServiceToken
+    Name: !Sub '${AWS::StackName}-gwlb-subnets'
+    SubnetIds: !Join [',', [!Ref ApplianceSubnetA, !Ref ApplianceSubnetB]]
+
+# then, in a security group rule:
+#   SourcePrefixListId: !GetAtt VpcPrefixList.PrefixListId
+```
+
+A prefix list counts against a security group's rule quota at its maximum
+size: a VPC list is created with room for five blocks, a subnet list with one
+entry per subnet. An update rewrites the same list, so the security groups
+that reference it are never replaced. Re-run a stack update after adding a
+CIDR block to the VPC to pick it up.
 
 Make the gateway Auto Scaling group depend on `GatewayManager` and `EipCleanup`,
 so its first lifecycle hooks reach a function that exists and the cleanup sweep
