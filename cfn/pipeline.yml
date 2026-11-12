@@ -38,6 +38,36 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: Grant public Deploy on the SAR application after publishing.
 
+  BuildVpcId:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. Run both CodeBuild projects in this VPC (for example, so builds
+      leave through a NAT with a fixed address). Leave empty to run them outside
+      any VPC. When set, BuildSubnetIds and BuildSecurityGroupId are required.
+
+  BuildSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Private subnets with a default route to a NAT, for BuildVpcId.
+
+  BuildSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: Security group for the builds' network interfaces, for BuildVpcId.
+
+Rules:
+  BuildVpcNeedsItsNetwork:
+    RuleCondition: !Not [!Equals [!Ref BuildVpcId, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Join ['', !Ref BuildSubnetIds], '']]
+        AssertDescription: BuildSubnetIds is required when BuildVpcId is set.
+      - Assert: !Not [!Equals [!Ref BuildSecurityGroupId, '']]
+        AssertDescription: BuildSecurityGroupId is required when BuildVpcId is set.
+
+Conditions:
+  InBuildVpc: !Not [!Equals [!Ref BuildVpcId, '']]
+
 Resources:
   # ---------------------------------------------------------------------------
   # Buckets
@@ -122,6 +152,28 @@ Resources:
               Service: codebuild.amazonaws.com
             Action: sts:AssumeRole
       Policies:
+        # What CodeBuild needs to place a build's network interface in
+        # BuildVpcId. Harmless when the builds run outside a VPC.
+        - PolicyName: BuildVpc
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                Resource: '*'
+              - Effect: Allow
+                Action: ec2:CreateNetworkInterfacePermission
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+                Condition:
+                  StringEquals:
+                    'ec2:AuthorizedService': codebuild.amazonaws.com
         - PolicyName: Logs
           PolicyDocument:
             Version: '2012-10-17'
@@ -208,9 +260,22 @@ Resources:
   # ---------------------------------------------------------------------------
   TestProject:
     Type: AWS::CodeBuild::Project
+    # The empty parameter defaults only reach VpcConfig when BuildVpcId is set,
+    # and the BuildVpcNeedsItsNetwork rule requires them then.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W1030]
     Properties:
       Name: !Sub '${AWS::StackName}-test'
       ServiceRole: !GetAtt CodeBuildRole.Arn
+      VpcConfig: !If
+        - InBuildVpc
+        - VpcId: !Ref BuildVpcId
+          Subnets: !Ref BuildSubnetIds
+          SecurityGroupIds:
+            - !Ref BuildSecurityGroupId
+        - !Ref AWS::NoValue
       Artifacts:
         Type: CODEPIPELINE
       Environment:
@@ -229,9 +294,22 @@ Resources:
 
   PublishProject:
     Type: AWS::CodeBuild::Project
+    # The empty parameter defaults only reach VpcConfig when BuildVpcId is set,
+    # and the BuildVpcNeedsItsNetwork rule requires them then.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W1030]
     Properties:
       Name: !Sub '${AWS::StackName}-publish'
       ServiceRole: !GetAtt CodeBuildRole.Arn
+      VpcConfig: !If
+        - InBuildVpc
+        - VpcId: !Ref BuildVpcId
+          Subnets: !Ref BuildSubnetIds
+          SecurityGroupIds:
+            - !Ref BuildSecurityGroupId
+        - !Ref AWS::NoValue
       Artifacts:
         Type: CODEPIPELINE
       Environment:
