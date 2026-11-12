@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >-
-  Metaphor Gateway manager: the Lambda functions a Metaphor Gateway deployment
+  Network by Metaphor manager: the Lambda functions a Network by Metaphor deployment
   needs (EIP/ENI lifecycle, NAT-only egress cutover, AMI auto-update, gossip
   secret and orphan-cleanup custom resources), for nesting in your own
   CloudFormation alongside the gateway's Auto Scaling groups.
@@ -10,7 +10,7 @@ Metadata:
   AWS::ServerlessRepo::Application:
     Name: metaphor-gateway-manager
     Description: >-
-      Lifecycle and maintenance Lambdas for Metaphor Gateway: public ENI and
+      Lifecycle and maintenance Lambdas for Network by Metaphor: public ENI and
       Elastic IP management (gwlb), persistent egress interface cutover
       (NAT-only), AMI auto-update, gossip HMAC secret and orphan cleanup.
     Author: Metaphor

@@ -1,4 +1,4 @@
-"""Rolls Metaphor Gateway Auto Scaling groups onto a newer 'latest' AMI.
+"""Rolls Network by Metaphor Auto Scaling groups onto a newer 'latest' AMI.
 
 Runs on a schedule. For each group in ASG_NAMES it compares the AMIs the
 group's instances run with the latest published Marketplace AMI (SSM_PARAM) and,
@@ -94,9 +94,9 @@ def notify(cfg, clients, name, latest, refresh_id):
     try:
         clients.sns.publish(
             TopicArn=cfg.topic_arn,
-            Subject=f"Metaphor Gateway: rolling {name} to a new AMI"[:100],
+            Subject=f"Network by Metaphor: rolling {name} to a new AMI"[:100],
             Message=(
-                f"A newer Metaphor Gateway AMI was detected.\n\n"
+                f"A newer Network by Metaphor AMI was detected.\n\n"
                 f"  Group:       {name}\n"
                 f"  New AMI:     {latest}\n"
                 f"  Refresh ID:  {refresh_id}\n\n"

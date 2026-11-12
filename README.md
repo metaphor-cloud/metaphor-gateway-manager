@@ -1,6 +1,6 @@
 # metaphor-gateway-manager
 
-The Lambda functions a Metaphor Gateway deployment needs, as one AWS Serverless
+The Lambda functions a Network by Metaphor deployment needs, as one AWS Serverless
 Application Repository app to nest in your own CloudFormation. Every function
 runs from the same code package (`src/`), one module per entrypoint:
 
@@ -12,7 +12,7 @@ runs from the same code package (`src/`), one module per entrypoint:
 | `gossip_secret` | Custom resource: generates the gossip HMAC key as an SSM SecureString | both |
 | `ami_updater` | Scheduled: starts an instance refresh when the gateways are behind the latest published AMI | both |
 
-Metaphor Gateway's AWS Marketplace templates ship the same modules inline,
+Network by Metaphor's AWS Marketplace templates ship the same modules inline,
 because Marketplace does not accept templates that deploy SAR resources.
 
 ## Using it

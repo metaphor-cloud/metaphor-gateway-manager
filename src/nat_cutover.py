@@ -281,7 +281,7 @@ def notify_refresh_cancelled(cfg, clients, asg, refresh_id, abandons):
     try:
         clients.sns.publish(
             TopicArn=cfg.notify_topic_arn,
-            Subject=f"Metaphor Gateway: update cancelled on {asg}"[:100],
+            Subject=f"Network by Metaphor: update cancelled on {asg}"[:100],
             Message=(f"Instance refresh {refresh_id} on {asg} was cancelled after {abandons} replacement "
                      f"gateways failed their cutover (reason=refresh_cancelled). The current gateway is "
                      f"still serving and keeps the egress interface. The new image did not report ready or "
