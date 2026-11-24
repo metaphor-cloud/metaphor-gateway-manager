@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.request
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -123,10 +124,29 @@ def publish_stable(cfg, clients):
         current = None
     if current != ami:
         # aws:ec2:image is the data type EC2 expects behind a resolve:ssm ImageId.
-        clients.ssm.put_parameter(Name=cfg.stable_param, Value=ami, Type="String",
-                                  DataType="aws:ec2:image", Overwrite=True)
+        written = clients.ssm.put_parameter(Name=cfg.stable_param, Value=ami, Type="String",
+                                            DataType="aws:ec2:image", Overwrite=True)["Version"]
+        wait_until_valid(clients, cfg.stable_param, written)
         logger.info("%s moved from %s to %s (stable %s)", cfg.stable_param, current or "nothing", ami, version)
     return ami
+
+
+def wait_until_valid(clients, name, version, timeout=60, interval=2):
+    """Parameter Store checks an aws:ec2:image value after accepting it, with the
+    writer's ec2:DescribeImages, and drops the version if that fails. Until it
+    passes, EC2 calls the parameter invalid, so a launch template created right
+    after the write fails. Wait for the version to become readable."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if clients.ssm.get_parameter(Name=name)["Parameter"]["Version"] >= version:
+                return
+        except clients.ssm.exceptions.ParameterNotFound:
+            pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"{name} version {version} never validated; the role needs ec2:DescribeImages "
+                               "and the AMI must be visible to this account")
+        time.sleep(interval)
 
 
 def cfn_send(event, context, status, data, reason=""):

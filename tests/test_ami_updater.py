@@ -339,3 +339,24 @@ def test_config_needs_a_source():
         app.Config(env={"ASG_NAMES": "a", "REFRESH_PREFERENCES": "{}"})
     with pytest.raises(ValueError):
         app.Config(env={"ASG_NAMES": "a", "REFRESH_PREFERENCES": "{}", "STABLE_PARAM": STABLE})
+
+
+def test_a_write_that_never_validates_fails_loudly(env, frozen, monkeypatch):
+    sent = Sent(monkeypatch)
+    real = env.ssm
+
+    class Dropping(VersionedSsm):
+        # Parameter Store accepts the write, then drops it when validation fails.
+        def put_parameter(self, **kw):
+            return {"Version": 1}
+
+        def get_parameter(self, Name):
+            raise real.exceptions.ParameterNotFound({"Error": {"Code": "ParameterNotFound"}}, "GetParameter")
+
+    monkeypatch.setattr(app.time, "sleep", lambda s: None)
+    ticks = iter(range(0, 1000, 10))
+    monkeypatch.setattr(app.time, "monotonic", lambda: next(ticks))
+    c = SimpleNamespace(ssm=Dropping(real, [("1.0.8", env.old, 9), ("1.0.9", env.new, 1)]), ec2=env.ec2,
+                        sns=env.sns, asg=FakeAsg({}))
+    app.handler(cfn_event("Create"), None, stable_cfg(), c)
+    assert sent.calls == [("Create", "FAILED", {})]

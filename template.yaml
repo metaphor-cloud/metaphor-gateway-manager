@@ -592,6 +592,9 @@ Resources:
                 - autoscaling:DescribeAutoScalingGroups
                 - autoscaling:DescribeInstanceRefreshes
                 - ec2:DescribeInstances
+                # Parameter Store validates the stable-ami value with the writer's
+                # permissions, and drops it if this is missing.
+                - ec2:DescribeImages
               Resource: '*'
             - Effect: Allow
               Action: autoscaling:StartInstanceRefresh
