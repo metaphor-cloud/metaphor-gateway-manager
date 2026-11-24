@@ -11,7 +11,7 @@ runs from the same code package (`src/`), one module per entrypoint:
 | `nat_cutover` | Moves each NAT-only group's persistent egress ENI onto its new gateway inside the launch lifecycle | nat-only |
 | `gossip_secret` | Custom resource: generates the gossip HMAC key as an SSM SecureString | both |
 | `network_details` | Custom resource: keeps a VPC's or subnets' IPv4 CIDRs in a managed prefix list for security group rules | both |
-| `ami_updater` | Scheduled: starts an instance refresh when the gateways are behind the latest published AMI | both |
+| `ami_updater` | Scheduled: starts an instance refresh when the gateways are behind the latest (or stable) AMI; with `Channel=stable` also the `Custom::StableAmi` custom resource | both |
 
 Network by Metaphor's AWS Marketplace templates ship the same modules inline,
 because Marketplace does not accept templates that deploy SAR resources.
@@ -115,6 +115,33 @@ Each NAT-only group needs a launch hook with `HeartbeatTimeout: 900` and
 interfaces `metaphor:stack-name=<GatewayStackName>`.
 
 Set `AutoUpdateEnabled=false` when the launch template pins an AMI version.
+
+### Following stable instead of latest
+
+`Channel=stable` follows the newest version that stayed the latest published
+version for `StableMinAgeDays` (default 2) without a newer one replacing it, so
+production runs only a release that has already been the newest for that long.
+The app writes that AMI to `/flow/<GatewayStackName>/stable-ami`. Point the
+launch template at it and create the parameter before the groups launch:
+
+```yaml
+LaunchTemplateData:
+  ImageId: !Sub resolve:ssm:/flow/${AWS::StackName}/stable-ami
+
+StableAmi:
+  Type: Custom::StableAmi
+  Properties:
+    ServiceToken: !GetAtt GatewayManager.Outputs.StableAmiServiceToken
+
+GatewayGroup:
+  Type: AWS::AutoScaling::AutoScalingGroup
+  DependsOn: StableAmi
+```
+
+With `AutoUpdateEnabled=true` the scheduled check moves the parameter when a
+newer version qualifies and rolls the groups onto it. Without it, stable is
+fixed when the stack is created; invoking the function moves it and rolls the
+groups.
 
 ## Developing
 

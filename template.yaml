@@ -20,7 +20,7 @@ Metadata:
     ReadmeUrl: README.md
     Labels: ['metaphor', 'nat', 'gwlb', 'eip', 'autoscaling', 'lifecycle-hook']
     HomePageUrl: https://github.com/metaphor-cloud/metaphor-gateway-manager
-    SemanticVersion: 0.3.0
+    SemanticVersion: 0.4.0
     SourceCodeUrl: https://github.com/metaphor-cloud/metaphor-gateway-manager
 
   AWS::CloudFormation::Interface:
@@ -47,6 +47,8 @@ Metadata:
       - Label:
           default: Auto-update
         Parameters:
+          - Channel
+          - StableMinAgeDays
           - AutoUpdateEnabled
           - UpdateCheckSchedule
           - UpdateNotificationEmail
@@ -133,6 +135,29 @@ Parameters:
       metaphor:stack-name=<GatewayStackName>.
 
   # --- Auto-update -----------------------------------------------------------
+  Channel:
+    Type: String
+    Default: latest
+    AllowedValues:
+      - latest
+      - stable
+    Description: >-
+      Which AMI the gateways follow. 'latest' is the newest published version,
+      read from /aws/service/marketplace/prod-34beghzp66pd4/latest. 'stable' is
+      the newest version that stayed the latest for StableMinAgeDays: this app
+      writes its AMI to /flow/<GatewayStackName>/stable-ami, so point the launch
+      template's ImageId at resolve:ssm:/flow/<GatewayStackName>/stable-ami and
+      make the Auto Scaling groups depend on a Custom::StableAmi (see the
+      StableAmiServiceToken output) so the parameter exists before they launch.
+
+  StableMinAgeDays:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    Description: >-
+      With Channel stable, how long a version must have been the newest
+      published one, without a newer version replacing it, to become stable.
+
   AutoUpdateEnabled:
     Type: String
     Default: 'true'
@@ -142,7 +167,9 @@ Parameters:
     Description: >-
       Periodically compare the gateways' AMI with the latest published Metaphor
       Gateway AMI and roll the Auto Scaling groups by instance refresh. Only
-      meaningful when the launch template resolves the 'latest' AMI.
+      meaningful when the launch template resolves the 'latest' or 'stable' AMI.
+      With Channel stable and this off, stable is fixed when the stack is
+      created; invoking the function moves it.
 
   UpdateCheckSchedule:
     Type: String
@@ -178,6 +205,8 @@ Conditions:
   IsGwlb: !Equals [!Ref Mode, gwlb]
   IsNatOnly: !Equals [!Ref Mode, nat-only]
   AutoUpdate: !Equals [!Ref AutoUpdateEnabled, 'true']
+  UsesStable: !Equals [!Ref Channel, stable]
+  HasAmiUpdater: !Or [!Condition AutoUpdate, !Condition UsesStable]
   HasUpdateEmail: !And
     - !Condition AutoUpdate
     - !Not [!Equals [!Ref UpdateNotificationEmail, '']]
@@ -509,17 +538,18 @@ Resources:
 
   AmiUpdaterLogGroup:
     Type: AWS::Logs::LogGroup
-    Condition: AutoUpdate
+    Condition: HasAmiUpdater
     Properties:
       LogGroupName: !Sub '/aws/lambda/${GatewayStackName}-ami-updater'
       RetentionInDays: 14
 
   # Starts an instance refresh on each group whose instances are behind the
-  # latest published AMI. In NAT-only the replacement launches first (max 200%)
-  # and the cutover moves the egress interface onto it.
+  # latest (or stable) AMI. In NAT-only the replacement launches first (max
+  # 200%) and the cutover moves the egress interface onto it. With Channel
+  # stable it also serves Custom::StableAmi, so it exists without auto-update.
   AmiUpdaterFunction:
     Type: AWS::Serverless::Function
-    Condition: AutoUpdate
+    Condition: HasAmiUpdater
     DependsOn: AmiUpdaterLogGroup
     Properties:
       FunctionName: !Sub '${GatewayStackName}-ami-updater'
@@ -528,8 +558,11 @@ Resources:
       Environment:
         Variables:
           ASG_NAMES: !If [IsGwlb, !Ref AsgName, !Ref NatAsgNames]
-          SSM_PARAM: '/aws/service/marketplace/prod-34beghzp66pd4/latest'
-          TOPIC_ARN: !Ref AmiUpdateTopic
+          SSM_PARAM: !If [UsesStable, !Ref AWS::NoValue, '/aws/service/marketplace/prod-34beghzp66pd4/latest']
+          STABLE_PARAM: !If [UsesStable, !Sub '/flow/${GatewayStackName}/stable-ami', !Ref AWS::NoValue]
+          PRODUCT_PATH: !If [UsesStable, '/aws/service/marketplace/prod-34beghzp66pd4', !Ref AWS::NoValue]
+          STABLE_MIN_AGE_DAYS: !Ref StableMinAgeDays
+          TOPIC_ARN: !If [AutoUpdate, !Ref AmiUpdateTopic, '']
           # A full EIP pool turns the refresh terminate-first (ami_updater).
           EIPS_PER_AZ: !If [IsGwlb, !Ref EipsPerAz, '0']
           REFRESH_PREFERENCES: !If
@@ -540,8 +573,18 @@ Resources:
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
-              Action: ssm:GetParameter
-              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/marketplace/*'
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParametersByPath
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/marketplace/*'
+                - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/marketplace/prod-34beghzp66pd4'
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:PutParameter
+                - ssm:DeleteParameter
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/flow/${GatewayStackName}/stable-ami'
             # Describe* calls take no resource-level permissions: scoped to the
             # ASG ARN they are denied, and the updater never refreshes.
             - Effect: Allow
@@ -559,14 +602,19 @@ Resources:
                   - Names: !Join
                       - ',arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/'
                       - !Split [',', !If [IsGwlb, !Ref AsgName, !Ref NatAsgNames]]
-            - Effect: Allow
-              Action: sns:Publish
-              Resource: !Ref AmiUpdateTopic
+            - !If
+              - AutoUpdate
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AmiUpdateTopic
+              - !Ref AWS::NoValue
       Events:
         Schedule:
           Type: Schedule
           Properties:
             Schedule: !Ref UpdateCheckSchedule
+            # Present for Channel stable without auto-update, so only runs when asked to.
+            State: !If [AutoUpdate, ENABLED, DISABLED]
 
 Outputs:
   GossipSecretServiceToken:
@@ -574,6 +622,14 @@ Outputs:
       ServiceToken for a Custom::GossipSecret with ParameterName
       /flow/<GatewayStackName>/gossip-hmac.
     Value: !GetAtt GossipSecretFunction.Arn
+
+  StableAmiServiceToken:
+    Condition: UsesStable
+    Description: >-
+      ServiceToken for a Custom::StableAmi (no properties). It writes the stable
+      AMI to /flow/<GatewayStackName>/stable-ami on create and update and removes
+      it on delete; make the gateway Auto Scaling groups depend on it.
+    Value: !GetAtt AmiUpdaterFunction.Arn
 
   NetworkDetailsServiceToken:
     Description: >-
