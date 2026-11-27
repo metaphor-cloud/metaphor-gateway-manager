@@ -565,9 +565,11 @@ Resources:
           TOPIC_ARN: !If [AutoUpdate, !Ref AmiUpdateTopic, '']
           # A full EIP pool turns the refresh terminate-first (ami_updater).
           EIPS_PER_AZ: !If [IsGwlb, !Ref EipsPerAz, '0']
+          # Max 200 launches each replacement before terminating its predecessor;
+          # without it Min 100 still terminates first and the AZ runs one gateway short.
           REFRESH_PREFERENCES: !If
             - IsGwlb
-            - '{"MinHealthyPercentage": 100, "InstanceWarmup": 120}'
+            - '{"MinHealthyPercentage": 100, "MaxHealthyPercentage": 200, "InstanceWarmup": 120}'
             - '{"MinHealthyPercentage": 100, "MaxHealthyPercentage": 200, "InstanceWarmup": 60}'
       Policies:
         - Version: '2012-10-17'

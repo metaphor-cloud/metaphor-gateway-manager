@@ -136,7 +136,7 @@ def test_publishes_the_refresh_to_the_topic(env):
     assert env.new in body["Message"]
 
 
-GWLB_PREFS = {"MinHealthyPercentage": 100, "InstanceWarmup": 120}
+GWLB_PREFS = {"MinHealthyPercentage": 100, "MaxHealthyPercentage": 200, "InstanceWarmup": 120}
 
 
 def test_full_eip_pool_refreshes_terminate_first_one_at_a_time(env):
@@ -360,3 +360,15 @@ def test_a_write_that_never_validates_fails_loudly(env, frozen, monkeypatch):
                         sns=env.sns, asg=FakeAsg({}))
     app.handler(cfn_event("Create"), None, stable_cfg(), c)
     assert sent.calls == [("Create", "FAILED", {})]
+
+
+def test_template_refreshes_launch_first():
+    # MinHealthyPercentage 100 alone still terminates before it launches, which
+    # left a two-gateway fleet on one healthy target for each replacement.
+    import pathlib, re
+    template = (pathlib.Path(__file__).resolve().parents[1] / "template.yaml").read_text()
+    block = template[template.index("REFRESH_PREFERENCES:"):]
+    prefs = [json.loads(p) for p in re.findall(r"'(\{\"MinHealthyPercentage\".*?\})'", block)[:2]]
+    assert len(prefs) == 2
+    for p in prefs:
+        assert p["MinHealthyPercentage"] == 100 and p["MaxHealthyPercentage"] == 200
