@@ -11,10 +11,9 @@ Metadata:
   AWS::ServerlessRepo::Application:
     Name: metaphor-gateway-manager
     Description: >-
-      Lifecycle and maintenance Lambdas for Network by Metaphor: public ENI and
-      Elastic IP management (gwlb), persistent egress interface cutover
-      (NAT-only), AMI auto-update, gossip HMAC secret, VPC and subnet prefix
-      lists for security groups, and orphan cleanup.
+      Lifecycle Lambdas for Network by Metaphor: public ENI and Elastic IP
+      management, NAT-only egress cutover, AMI auto-update, gossip HMAC secret,
+      VPC and subnet prefix lists, and orphan cleanup.
     Author: Metaphor
     LicenseUrl: LICENSE
     ReadmeUrl: README.md
